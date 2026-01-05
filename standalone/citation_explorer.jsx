@@ -31,15 +31,18 @@ function makePaper(paper_info) {
 
 async function fetchRetry({
   url,
-  max_retries = 4,
+  max_retries = 8,
   delay = 500,
   callback = null,
+  post = false,
 }) {
   for (let i = 0; i < max_retries; i++) {
     try {
       // SemanticScholar does not set correct CORS headers when rate limiting (429, Too many requests),
       // which will throw an exception rather than a normal response.
-      const response = await fetch(url);
+      const response = post
+        ? await fetch(url, { method: "POST", body: JSON.stringify({}) })
+        : await fetch(url);
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -56,7 +59,7 @@ async function fetchRetry({
       console.info(error);
       callback?.(delay);
       await new Promise((r) => setTimeout(r, delay));
-      delay *= 2;
+      delay *= 1.1;
     }
   }
   callback?.(null);
@@ -105,6 +108,23 @@ async function fetchPaperReferences(paper_id, callback = null) {
     return references["data"].map((reference) =>
       makePaper(reference.citedPaper),
     );
+  } else {
+    return null;
+  }
+}
+
+async function batchFetchPaperCitationsAndReferences(
+  paper_ids,
+  callback = null,
+) {
+  const response = await fetchRetry({
+    url: "https://api.semanticscholar.org/graph/v1/paper/batch",
+    callback: callback,
+    post: { ids: paper_ids, fields: ["paperId", "citations", "references"] },
+  });
+  if (response.ok) {
+    const references = await response.json();
+    return references["data"];
   } else {
     return null;
   }
@@ -400,6 +420,7 @@ function PaperTable({
   selectedPapers,
   hiddenPapers,
   numRelatedPapers,
+  communityDetectionResults,
   selectPaper,
   deselectPaper,
   hidePaper,
@@ -420,18 +441,18 @@ function PaperTable({
     {
       name: "Title",
       value: (paper_id) => paperInfo[paper_id].title,
-      width: "30%",
+      width: "25%",
     },
     {
       name: "Authors",
       value: (paper_id) =>
         paperInfo[paper_id].authors.map((author) => author.name).join(", "),
-      width: "25%",
+      width: "20%",
     },
     {
       name: "Venue",
       value: (paper_id) => paperInfo[paper_id].venue,
-      width: "20%",
+      width: "15%",
     },
     {
       name: "Year",
@@ -446,7 +467,18 @@ function PaperTable({
     {
       name: "Edges",
       value: (paper_id) => numRelatedPapers[paper_id],
-      width: "4em",
+      width: "3em",
+    },
+    {
+      name: "CoCitation",
+      value: (paper_id) => communityDetectionResults.coCitationScores[paper_id],
+      width: "3em",
+    },
+    {
+      name: "BibCoupling",
+      value: (paper_id) =>
+        communityDetectionResults.bibCouplingScores[paper_id],
+      width: "3em",
     },
     // Special column: link to paper
   ];
@@ -563,6 +595,8 @@ function PaperTable({
                 <td>{paper.year}</td>
                 <td>{paper.citationCount}</td>
                 <td>{numRelatedPapers[paper_id]}</td>
+                <td>{communityDetectionResults.coCitationScores[paper_id]}</td>
+                <td>{communityDetectionResults.bibCouplingScores[paper_id]}</td>
                 <td className="table-icon">
                   <a
                     href={paper.url}
@@ -666,6 +700,71 @@ function PaperTable({
   );
 }
 
+function communityDetection({ corePaperIds, paperInfo }) {
+  let citations = {};
+  Object.entries(paperInfo).forEach(([id, paper]) => {
+    citations[id] = paper.citation_ids;
+  });
+  let references = {};
+  Object.entries(paperInfo).forEach(([id, paper]) => {
+    references[id] = paper.reference_ids;
+  });
+  let allPaperIds = Object.keys(paperInfo);
+
+  function coCitation({ idA, idB }) {
+    let citationsToAAndB = Object.keys(citations).filter(
+      (citingPaper, citedPapers) =>
+        Object.keys(citedPapers).includes(idA) &&
+        Object.keys(citedPapers).includes(idB),
+    );
+    return citationsToAAndB.length;
+  }
+
+  function bibCoupling({ idA, idB }) {
+    let refsA = references[idA];
+    let refsB = references[idB];
+    let referencedByAAndB = Object.keys(refsA).filter((ref) =>
+      Object.keys(refsB).includes(ref),
+    );
+    return referencedByAAndB.length;
+  }
+
+  let coCitations = {};
+  let bibCouplings = {};
+
+  for (let idA of corePaperIds) {
+    coCitations[idA] = {};
+    for (let idB of allPaperIds) {
+      if (idA === idB) {
+        continue;
+      }
+      coCitations[idA][idB] = coCitation({ idA, idB, citations });
+    }
+    bibCouplings[idA] = {};
+    for (let idB of allPaperIds) {
+      if (idA === idB) {
+        continue;
+      }
+      bibCouplings[idA][idB] = bibCoupling({ idA, idB, references });
+    }
+  }
+
+  let coCitationScores = {};
+  let bibCouplingScores = {};
+  for (let idB of allPaperIds) {
+    coCitationScores[idB] = Object.keys(coCitations)
+      .map((idA) => (idB in coCitations[idA] ? coCitations[idA][idB] : 0))
+      .reduce((a, b) => a + b, 0);
+    bibCouplingScores[idB] = Object.keys(bibCouplings)
+      .map((idA) => (idA in bibCouplings[idA] ? bibCouplings[idA][idA] : 0))
+      .reduce((a, b) => a + b, 0);
+  }
+  return {
+    coCitationScores: coCitationScores,
+    bibCouplingScores: bibCouplingScores,
+  };
+}
+
 // ----- Main component -------------------------------------------------------
 function CitationExplorerApp() {
   // info about the papers
@@ -675,6 +774,9 @@ function CitationExplorerApp() {
   const [hiddenPapers, setHiddenPapers] = useState([]);
   const [statusMessage, setStatusMessage] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
+  const [communityDetectionResults, setCommunityDetectionResults] = useState(
+    {},
+  );
 
   function info(message) {
     console.info(message);
@@ -743,6 +845,13 @@ function CitationExplorerApp() {
     });
 
     setNumRelatedPapers(newNumRelatedPapers);
+
+    setCommunityDetectionResults(
+      communityDetection({
+        corePaperIds: selectedPapers,
+        paperInfo: paperInfo,
+      }),
+    );
   }
 
   function updatePaperList(selectedPapers) {
@@ -795,40 +904,72 @@ function CitationExplorerApp() {
     }
 
     // add info about related papers
+
+    var new_paper_info = paperInfo;
+    console.log(new_paper_info);
+
     references.forEach((reference) => {
       if (reference.paperId !== null && !(reference.paperId in paperInfo)) {
-        setPaperInfo((paperInfo) => ({
-          ...paperInfo,
-          [reference.paperId]: reference,
-        }));
+        new_paper_info[reference.paperId] = reference;
       }
     });
     citations.forEach((citation) => {
       if (citation.paperId !== null && !(citation.paperId in paperInfo)) {
-        setPaperInfo((paperInfo) => ({
-          ...paperInfo,
-          [citation.paperId]: citation,
-        }));
+        new_paper_info[citation.paperId] = citation;
       }
     });
 
     // add references and citations to the paper info
     console.log("setting info for paper " + paper_id);
+    console.log(new_paper_info[paper_id]);
+    var updated_paper = { ...new_paper_info[paper_id] };
+    updated_paper.reference_ids = references.map((ref) => ref.paperId);
+    updated_paper.citation_ids = citations.map((cit) => cit.paperId);
+    new_paper_info[paper_id] = updated_paper;
+    setPaperInfo(new_paper_info);
 
-    var updated_paper = { ...paperInfo[paper_id] };
-    updated_paper.reference_ids = references.map(
-      (reference) => reference.paperId,
+    console.log("Updating citations for related papers...");
+
+    console.log(new_paper_info);
+
+    // Fill in citations and references for papers that are missing this info
+    const missingPaperIds = Object.keys(new_paper_info).filter(
+      (paperId) =>
+        new_paper_info[paperId].reference_ids == null ||
+        new_paper_info[paperId].citation_ids === null,
     );
-    updated_paper.citation_ids = citations.map((citation) => citation.paperId);
-    setPaperInfo((paperInfo) => ({
-      ...paperInfo,
-      [paper_id]: {
-        ...paperInfo[paper_id],
-        reference_ids: references.map((reference) => reference.paperId),
-        citation_ids: citations.map((citation) => citation.paperId),
-      },
-    }));
 
+    console.log("Papers with missing refs", missingPaperIds);
+
+    if (missingPaperIds.length > 0) {
+      const citationsAndRefs = await batchFetchPaperCitationsAndReferences(
+        missingPaperIds,
+        retryCallback,
+      );
+
+      console.log(
+        "Fetched additional citation and references",
+        citationsAndRefs,
+      );
+
+      if (citationsAndRefs == null) {
+        error("Unable to fetch additional citation and references...");
+        return;
+      }
+
+      for (const paper of citationsAndRefs) {
+        if (paper.paperId in new_paper_info) {
+          new_paper_info[paper.paperId].reference_ids = paper.references.map(
+            (ref) => ref.paperId,
+          );
+          new_paper_info[paper.paperId].citation_ids = paper.citations.map(
+            (cit) => cit.paperId,
+          );
+        }
+      }
+    }
+
+    setPaperInfo(new_paper_info);
     setStatusMessage("");
   }
 
@@ -900,6 +1041,7 @@ function CitationExplorerApp() {
         selectedPapers={selectedPapers}
         hiddenPapers={hiddenPapers}
         numRelatedPapers={numRelatedPapers}
+        communityDetectionResults={communityDetectionResults}
         selectPaper={selectPaper}
         deselectPaper={deselectPaper}
         hidePaper={hidePaper}
